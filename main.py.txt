@@ -1,0 +1,252 @@
+import os
+import asyncio
+import sqlite3
+import time
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+
+# 🔐 TOKEN FROM RENDER ENV
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not found in Environment Variables")
+
+
+# BOT
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# DB
+db = sqlite3.connect("prpraim.db", check_same_thread=False)
+cursor = db.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users(
+user_id INTEGER PRIMARY KEY,
+balance INTEGER DEFAULT 0,
+exp INTEGER DEFAULT 0,
+last_task INTEGER DEFAULT 0
+)
+""")
+db.commit()
+
+
+TASKS = [1000, 850, 1500, 700, 400, 950, 1200, 500, 2000, 650]
+
+
+# STATES
+class ReportState(StatesGroup):
+    text = State()
+
+class GiveState(StatesGroup):
+    uid = State()
+    amount = State()
+
+
+# DB
+def get_user(uid):
+    cursor.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    row = cursor.fetchone()
+
+    if not row:
+        cursor.execute("INSERT INTO users(user_id) VALUES(?)", (uid,))
+        db.commit()
+        return get_user(uid)
+
+    return row
+
+
+def add_balance(uid, amount):
+    cursor.execute(
+        "UPDATE users SET balance=balance+? WHERE user_id=?",
+        (amount, uid)
+    )
+    db.commit()
+
+
+# KEYBOARDS
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👨‍💻 Заработать", callback_data="earn")],
+        [InlineKeyboardButton(text="📱 Кабинет", callback_data="profile")],
+        [InlineKeyboardButton(text="⚙️ Admin", callback_data="admin")]
+    ])
+
+
+def earn_menu():
+    rows = []
+
+    for i, reward in enumerate(TASKS):
+        rows.append([
+            InlineKeyboardButton(text=f"{reward} 💰", url="https://t.me/telegram"),
+            InlineKeyboardButton(text="🔄 Проверить", callback_data=f"check_{i}")
+        ])
+
+    rows.append([InlineKeyboardButton(text="🛑 Пожаловаться", callback_data="report")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# START
+@dp.message(CommandStart())
+async def start(message: Message):
+    uid = message.from_user.id
+    user = get_user(uid)
+
+    await message.answer(
+        f"""
+⚫ PR PRAIM
+
+ID: {uid}
+Баланс: {user[1]} PRM
+""",
+        reply_markup=main_menu()
+    )
+
+
+# EARN
+@dp.callback_query(F.data == "earn")
+async def earn(call: CallbackQuery):
+    await call.message.edit_text(
+        "⚠️ Важно\n\nОтмена задания: штраф x2",
+        reply_markup=earn_menu()
+    )
+
+
+# CHECK
+@dp.callback_query(F.data.startswith("check_"))
+async def check(call: CallbackQuery):
+    uid = call.from_user.id
+    user = get_user(uid)
+
+    now = int(time.time())
+
+    if now - user[3] < 5:
+        await call.answer("Cooldown 5 сек", show_alert=True)
+        return
+
+    reward = 100
+    add_balance(uid, reward)
+
+    cursor.execute(
+        "UPDATE users SET last_task=? WHERE user_id=?",
+        (now, uid)
+    )
+    db.commit()
+
+    await call.answer(f"+{reward} PRM")
+
+
+# PROFILE
+@dp.callback_query(F.data == "profile")
+async def profile(call: CallbackQuery):
+    uid = call.from_user.id
+    user = get_user(uid)
+
+    rank = user[2] // 100 + 1
+
+    await call.message.edit_text(
+        f"""
+🏆 Кабинет
+
+ID: {uid}
+Баланс: {user[1]} PRM
+Ранг: {rank}
+""",
+        reply_markup=main_menu()
+    )
+
+
+# REPORT
+@dp.callback_query(F.data == "report")
+async def report(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ReportState.text)
+    await call.message.answer("Опиши жалобу текстом.")
+
+
+@dp.message(ReportState.text)
+async def report_text(message: Message, state: FSMContext):
+    await bot.send_message(
+        5420085029,
+        f"📕 НОВАЯ ЖАЛОБА\n\nUSER: {message.from_user.id}\n\nTEXT:\n{message.text}"
+    )
+
+    await message.answer("Жалоба отправлена.")
+    await state.clear()
+
+
+# ADMIN
+@dp.callback_query(F.data == "admin")
+async def admin(call: CallbackQuery):
+    if call.from_user.id != 5420085029:
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Начислить PRM", callback_data="give")]
+    ])
+
+    await call.message.edit_text("⚙️ ADMIN PANEL", reply_markup=kb)
+
+
+# GIVE
+@dp.callback_query(F.data == "give")
+async def give(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != 5420085029:
+        return
+
+    await state.set_state(GiveState.uid)
+    await call.message.answer("ID пользователя:")
+
+
+@dp.message(GiveState.uid)
+async def give_uid(message: Message, state: FSMContext):
+    await state.update_data(uid=message.text)
+    await state.set_state(GiveState.amount)
+    await message.answer("Сумма:")
+
+
+@dp.message(GiveState.amount)
+async def give_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    uid = int(data["uid"])
+    amount = int(message.text)
+
+    add_balance(uid, amount)
+
+    await bot.send_message(uid, f"🎁 +{amount} PRM")
+
+    await message.answer("Начислено.")
+    await state.clear()
+
+
+# BACK
+@dp.callback_query(F.data == "back")
+async def back(call: CallbackQuery):
+    await call.message.edit_text("Главное меню", reply_markup=main_menu())
+
+
+# RUN
+async def main():
+    print("PR PRAIM RUNNING")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
